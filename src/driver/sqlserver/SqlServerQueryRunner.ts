@@ -721,13 +721,18 @@ export class SqlServerQueryRunner
     /**
      * Creates a new view.
      */
-    async createView(view: View): Promise<void> {
+    async createView(
+        view: View,
+        syncWithMetadata: boolean = false,
+    ): Promise<void> {
         const upQueries: Query[] = []
         const downQueries: Query[] = []
         upQueries.push(this.createViewSql(view))
-        upQueries.push(await this.insertViewDefinitionSql(view))
+        if (syncWithMetadata)
+            upQueries.push(await this.insertViewDefinitionSql(view))
         downQueries.push(this.dropViewSql(view))
-        downQueries.push(await this.deleteViewDefinitionSql(view))
+        if (syncWithMetadata)
+            downQueries.push(await this.deleteViewDefinitionSql(view))
         await this.executeQueries(upQueries, downQueries)
     }
 
@@ -1561,7 +1566,9 @@ export class SqlServerQueryRunner
                 oldColumn.name = newColumn.name
             }
 
-            if (this.isColumnChanged(oldColumn, newColumn, false)) {
+            if (
+                this.isColumnChanged(oldColumn, newColumn, false, false, false)
+            ) {
                 upQueries.push(
                     new Query(
                         `ALTER TABLE ${this.escapePath(
@@ -1571,6 +1578,7 @@ export class SqlServerQueryRunner
                             newColumn,
                             true,
                             false,
+                            true,
                         )}`,
                     ),
                 )
@@ -1583,9 +1591,38 @@ export class SqlServerQueryRunner
                             oldColumn,
                             true,
                             false,
+                            true,
                         )}`,
                     ),
                 )
+            }
+
+            if (this.isEnumChanged(oldColumn, newColumn)) {
+                const oldExpression = this.getEnumExpression(oldColumn)
+                const oldCheck = new TableCheck({
+                    name: this.connection.namingStrategy.checkConstraintName(
+                        table,
+                        oldExpression,
+                        true,
+                    ),
+                    expression: oldExpression,
+                })
+
+                const newExpression = this.getEnumExpression(newColumn)
+                const newCheck = new TableCheck({
+                    name: this.connection.namingStrategy.checkConstraintName(
+                        table,
+                        newExpression,
+                        true,
+                    ),
+                    expression: newExpression,
+                })
+
+                upQueries.push(this.dropCheckConstraintSql(table, oldCheck))
+                upQueries.push(this.createCheckConstraintSql(table, newCheck))
+
+                downQueries.push(this.dropCheckConstraintSql(table, newCheck))
+                downQueries.push(this.createCheckConstraintSql(table, oldCheck))
             }
 
             if (newColumn.isPrimary !== oldColumn.isPrimary) {
@@ -3899,17 +3936,14 @@ export class SqlServerQueryRunner
         column: TableColumn,
         skipIdentity: boolean,
         createDefault: boolean,
+        skipEnum?: boolean,
     ) {
         let c = `"${column.name}" ${this.connection.driver.createFullType(
             column,
         )}`
 
-        if (column.enum) {
-            const expression =
-                column.name +
-                " IN (" +
-                column.enum.map((val) => "'" + val + "'").join(",") +
-                ")"
+        if (!skipEnum && column.enum) {
+            const expression = this.getEnumExpression(column)
             const checkName =
                 this.connection.namingStrategy.checkConstraintName(
                     table,
@@ -3969,6 +4003,18 @@ export class SqlServerQueryRunner
             c += ` CONSTRAINT "${defaultName}" DEFAULT NEWSEQUENTIALID()`
         }
         return c
+    }
+
+    private getEnumExpression(column: TableColumn) {
+        if (!column.enum) {
+            throw new Error(`Enum is not defined in column ${column.name}`)
+        }
+        return (
+            column.name +
+            " IN (" +
+            column.enum.map((val) => "'" + val + "'").join(",") +
+            ")"
+        )
     }
 
     protected isEnumCheckConstraint(name: string): boolean {
